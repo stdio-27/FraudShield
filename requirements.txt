@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+pandas
+scikit-learn
+imbalanced-learn
+xgboost
+shap
+psycopg2-binary
+sqlalchemy
+redis
