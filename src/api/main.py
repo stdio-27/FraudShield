@@ -1,63 +1,258 @@
 import os
 import time
+import uuid
+import json
+from datetime import datetime, timezone, timedelta
 import logging
-from fastapi import FastAPI, HTTPException
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
-from .schemas import TransactionRequest, TransactionResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text, func
+
+from .schemas import TransactionRequest, TransactionResponse, AnalystCreate, AnalystResponse, Token
 from .services import model_manager
+from .database import engine, Base, get_db
+from .models import Transaction, FraudAlert, Analyst, RoleEnum
+from .auth import hash_password, verify_password, create_access_token, get_current_active_analyst
 
 logging.basicConfig(level=logging.INFO)
 
+# Project anchor date: Kaggle dataset time_seconds are elapsed seconds from
+# the first transaction.  We anchor them to a fixed base date so that
+# datetime.fromtimestamp produces meaningful wall-clock timestamps.
+_ANCHOR_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+redis_client = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle event to load ML models purely once at startup into memory."""
+    # 1. Load ML Models
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         models_dir = os.path.join(base_dir, "models")
         model_manager.load_artifacts(models_dir)
     except Exception as e:
         logging.error(f"Failed to load ML artifacts: {e}")
-        # Allows API to start and fail gracefully on request if models are missing
+
+    # 2. Database Initialization & TimescaleDB setup
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Create hypertable
+        try:
+            await conn.execute(text(
+                "SELECT create_hypertable('transactions', 'transaction_time', if_not_exists => TRUE);"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_transactions_time ON transactions (transaction_time DESC);"
+            ))
+        except Exception as e:
+            logging.warning(
+                f"TimescaleDB hypertable setup note (may already exist or extension not loaded): {e}"
+            )
+
+    # 3. Redis Initialization
+    global redis_client
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+
     yield
-    logging.info("Shutting down API...")
+
+    # Shutdown
+    await redis_client.aclose()
+
 
 app = FastAPI(
-    title="FraudShield Serving API",
-    description="Real-time <300ms Credit Card Fraud Detection API",
-    version="0.3.0",
-    lifespan=lifespan
+    title="FraudShield API",
+    description="Real-time Fraud Detection with Persistent DB and Cache",
+    version="0.4.1",
+    lifespan=lifespan,
 )
 
-@app.post("/transactions/score", response_model=TransactionResponse)
-async def score_transaction(request: TransactionRequest):
-    """Scores an incoming transaction for fraud probability."""
-    start_time = time.perf_counter()
-    
+
+# ---------------------------------------------------------------------------
+# AUTH ROUTES
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/register", response_model=AnalystResponse)
+async def register(analyst_data: AnalystCreate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Analyst).where(Analyst.email == analyst_data.email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed_pw = hash_password(analyst_data.password)
+
+    # Safely coerce the incoming role string to the RoleEnum; default to analyst
     try:
-        # Use model_dump if using Pydantic V2, dict for V1
-        req_dict = request.dict() if hasattr(request, "dict") else request.model_dump()
+        role_enum = RoleEnum(analyst_data.role)
+    except ValueError:
+        role_enum = RoleEnum.analyst
+
+    new_analyst = Analyst(
+        email=analyst_data.email,
+        password_hash=hashed_pw,
+        role=role_enum,
+    )
+
+    db.add(new_analyst)
+    await db.commit()
+    await db.refresh(new_analyst)
+
+    return AnalystResponse(
+        analyst_id=str(new_analyst.analyst_id),
+        email=new_analyst.email,
+        role=new_analyst.role.value,
+    )
+
+
+@app.post("/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Analyst).where(Analyst.email == form_data.username))
+    analyst = result.scalars().first()
+
+    if not analyst or not verify_password(form_data.password, analyst.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token_expires = timedelta(minutes=60)
+    access_token = create_access_token(
+        data={"sub": analyst.email, "role": analyst.role.value},
+        expires_delta=access_token_expires,
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+# ---------------------------------------------------------------------------
+# TRANSACTION SCORING
+# ---------------------------------------------------------------------------
+
+@app.post("/transactions/score", response_model=TransactionResponse)
+async def score_transaction(request: TransactionRequest, db: AsyncSession = Depends(get_db)):
+    start_time = time.perf_counter()
+
+    req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    try:
         fraud_score, is_flagged, decision, shap_reasons = model_manager.predict(req_dict)
+
+        # --- Safe UUID parsing (handles plain-text transaction IDs) ---
+        try:
+            tx_id = uuid.UUID(request.transaction_id)
+        except ValueError:
+            tx_id = uuid.uuid4()
+            logging.warning(
+                f"Non-UUID transaction_id '{request.transaction_id}' received. "
+                f"Generated fallback UUID: {tx_id}"
+            )
+
+        # --- Timestamp mapping ---
+        # Kaggle time_seconds are small elapsed seconds (0 – 172 792).
+        # Anchor them to a fixed base date so the hypertable gets real datetimes.
+        computed_timestamp = _ANCHOR_DATE + timedelta(seconds=request.time_seconds)
+
+        # --- Extract engineered features for DB storage ---
+        df_eng = model_manager._engineer_features(req_dict).iloc[0]
+
+        # --- Build Transaction ORM object ---
+        new_tx = Transaction(
+            tx_id=tx_id,
+            transaction_time=computed_timestamp,
+            amount=request.amount,
+            v1=request.v1, v2=request.v2, v3=request.v3, v4=request.v4,
+            v5=request.v5, v6=request.v6, v7=request.v7, v8=request.v8,
+            v9=request.v9, v10=request.v10, v11=request.v11, v12=request.v12,
+            v13=request.v13, v14=request.v14, v15=request.v15, v16=request.v16,
+            v17=request.v17, v18=request.v18, v19=request.v19, v20=request.v20,
+            v21=request.v21, v22=request.v22, v23=request.v23, v24=request.v24,
+            v25=request.v25, v26=request.v26, v27=request.v27, v28=request.v28,
+            hour_of_day=int(df_eng["hour_of_day"]),
+            amount_zscore=float(df_eng["amount_zscore"]),
+            fraud_score=fraud_score,
+            is_flagged=is_flagged,
+        )
+        db.add(new_tx)
+
+        # --- Auto-create fraud alert if flagged ---
+        if is_flagged:
+            new_alert = FraudAlert(
+                tx_id=tx_id,
+                fraud_score=fraud_score,
+                shap_reasons=shap_reasons,  # stored as JSONB
+            )
+            db.add(new_alert)
+
+        await db.commit()
+
     except Exception as e:
-        logging.error(f"Inference error: {e}")
-        raise HTTPException(status_code=500, detail="Internal inference error.")
-        
+        logging.error(f"Inference/DB error: {e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
     end_time = time.perf_counter()
     latency_ms = int((end_time - start_time) * 1000)
-    
+
     return TransactionResponse(
         transaction_id=request.transaction_id,
         fraud_score=fraud_score,
         is_flagged=is_flagged,
         decision=decision,
         shap_reasons=shap_reasons,
-        latency_ms=latency_ms
+        latency_ms=latency_ms,
     )
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD (JWT-PROTECTED, REDIS-CACHED)
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/stats")
+async def get_dashboard_stats(
+    db: AsyncSession = Depends(get_db),
+    current_user: Analyst = Depends(get_current_active_analyst),
+):
+    """Protected endpoint to retrieve fraud stats, cached in Redis."""
+    cache_key = "dashboard_stats"
+    cached_stats = await redis_client.get(cache_key)
+
+    if cached_stats:
+        return json.loads(cached_stats)
+
+    # Total transactions
+    total_tx_result = await db.execute(select(func.count(Transaction.tx_id)))
+    total_tx = total_tx_result.scalar() or 0
+
+    # Flagged transactions
+    flagged_tx_result = await db.execute(
+        select(func.count(Transaction.tx_id)).where(Transaction.is_flagged == True)  # noqa: E712
+    )
+    flagged_tx = flagged_tx_result.scalar() or 0
+
+    # Open Alerts
+    open_alerts_result = await db.execute(
+        select(func.count(FraudAlert.alert_id)).where(FraudAlert.status == "open")
+    )
+    open_alerts = open_alerts_result.scalar() or 0
+
+    stats = {
+        "total_transactions": total_tx,
+        "flagged_transactions": flagged_tx,
+        "open_alerts": open_alerts,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Cache for 60 seconds
+    await redis_client.set(cache_key, json.dumps(stats), ex=60)
+
+    return stats
+
 
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Health check to verify API and Model Manager readiness."""
     artifacts_loaded = model_manager.model is not None
-    return {
-        "status": "healthy",
-        "artifacts_loaded": artifacts_loaded
-    }
+    return {"status": "healthy", "artifacts_loaded": artifacts_loaded}

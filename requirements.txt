@@ -9,5 +9,6 @@ imbalanced-learn
 xgboost
 shap
 psycopg2-binary
+asyncpg
 sqlalchemy
 redis
