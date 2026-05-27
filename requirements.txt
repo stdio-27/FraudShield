@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-pydantic
+pydantic[email]
 python-jose[cryptography]
 passlib[bcrypt]
 pandas
@@ -12,3 +12,5 @@ psycopg2-binary
 asyncpg
 sqlalchemy
 redis
+httpx
+joblib

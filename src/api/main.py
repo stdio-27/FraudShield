@@ -17,6 +17,8 @@ from .services import model_manager
 from .database import engine, Base, get_db
 from .models import Transaction, FraudAlert, Analyst, RoleEnum
 from .auth import hash_password, verify_password, create_access_token, get_current_active_analyst
+from .analytics import get_rolling_fraud_metrics, get_fraud_summary, get_top_at_risk_analysts
+from .alerts import evaluate_and_dispatch_alert
 
 logging.basicConfig(level=logging.INFO)
 
@@ -67,8 +69,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FraudShield API",
-    description="Real-time Fraud Detection with Persistent DB and Cache",
-    version="0.4.1",
+    description="Real-time Fraud Detection with Persistent DB, Cache, Analytics & Alerting",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -129,7 +131,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
 
 
 # ---------------------------------------------------------------------------
-# TRANSACTION SCORING
+# TRANSACTION SCORING  (now with real-time alert dispatch)
 # ---------------------------------------------------------------------------
 
 @app.post("/transactions/score", response_model=TransactionResponse)
@@ -151,8 +153,6 @@ async def score_transaction(request: TransactionRequest, db: AsyncSession = Depe
             )
 
         # --- Timestamp mapping ---
-        # Kaggle time_seconds are small elapsed seconds (0 – 172 792).
-        # Anchor them to a fixed base date so the hypertable gets real datetimes.
         computed_timestamp = _ANCHOR_DATE + timedelta(seconds=request.time_seconds)
 
         # --- Extract engineered features for DB storage ---
@@ -182,11 +182,20 @@ async def score_transaction(request: TransactionRequest, db: AsyncSession = Depe
             new_alert = FraudAlert(
                 tx_id=tx_id,
                 fraud_score=fraud_score,
-                shap_reasons=shap_reasons,  # stored as JSONB
+                shap_reasons=shap_reasons,
             )
             db.add(new_alert)
 
         await db.commit()
+
+        # --- Real-time alert dispatch (fire-and-forget, non-blocking) ---
+        evaluate_and_dispatch_alert(
+            tx_id=tx_id,
+            amount=request.amount,
+            fraud_score=fraud_score,
+            is_flagged=is_flagged,
+            shap_reasons=shap_reasons,
+        )
 
     except Exception as e:
         logging.error(f"Inference/DB error: {e}", exc_info=True)
@@ -207,10 +216,86 @@ async def score_transaction(request: TransactionRequest, db: AsyncSession = Depe
 
 
 # ---------------------------------------------------------------------------
+# ANALYTICS ROUTES  (JWT-PROTECTED, REDIS-CACHED)
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/summary", tags=["Analytics"])
+async def analytics_summary(
+    db: AsyncSession = Depends(get_db),
+    current_user: Analyst = Depends(get_current_active_analyst),
+):
+    """
+    Returns a high-level fraud summary across all transactions.
+    Cached in Redis for 30 seconds.
+    """
+    cache_key = "analytics:summary"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    summary = await get_fraud_summary(db)
+    summary["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    await redis_client.set(cache_key, json.dumps(summary), ex=30)
+    return summary
+
+
+@app.get("/analytics/time-series", tags=["Analytics"])
+async def analytics_time_series(
+    window_minutes: int = 60,
+    db: AsyncSession = Depends(get_db),
+    current_user: Analyst = Depends(get_current_active_analyst),
+):
+    """
+    Returns rolling fraud metrics grouped into 5-minute time buckets
+    over the last *window_minutes* (default 60).
+    Cached in Redis for 30 seconds, keyed by window size.
+    """
+    cache_key = f"analytics:timeseries:{window_minutes}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    buckets = await get_rolling_fraud_metrics(db, window_minutes=window_minutes)
+    result = {
+        "window_minutes": window_minutes,
+        "buckets": buckets,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await redis_client.set(cache_key, json.dumps(result), ex=30)
+    return result
+
+
+@app.get("/analytics/alert-telemetry", tags=["Analytics"])
+async def analytics_alert_telemetry(
+    db: AsyncSession = Depends(get_db),
+    current_user: Analyst = Depends(get_current_active_analyst),
+):
+    """
+    Returns audit telemetry on open/investigating alert volume.
+    Cached in Redis for 30 seconds.
+    """
+    cache_key = "analytics:alert_telemetry"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    telemetry = await get_top_at_risk_analysts(db)
+    result = {
+        "telemetry": telemetry,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await redis_client.set(cache_key, json.dumps(result), ex=30)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # DASHBOARD (JWT-PROTECTED, REDIS-CACHED)
 # ---------------------------------------------------------------------------
 
-@app.get("/dashboard/stats")
+@app.get("/dashboard/stats", tags=["Dashboard"])
 async def get_dashboard_stats(
     db: AsyncSession = Depends(get_db),
     current_user: Analyst = Depends(get_current_active_analyst),
@@ -250,6 +335,10 @@ async def get_dashboard_stats(
 
     return stats
 
+
+# ---------------------------------------------------------------------------
+# HEALTH
+# ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
 async def health_check():
