@@ -1,6 +1,23 @@
 node_modules/
 .env
+.env.local
 dist/
+__pycache__/
+*.pyc
+
 # Ignore raw data files
 data/
 *.csv
+
+# Virtual environments
+.venv/
+venv/
+
+# Model artifacts (large binaries — download or train locally)
+models/*.json
+models/*.pkl
+models/*.joblib
+
+# IDE
+.vscode/
+.idea/

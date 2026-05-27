@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 import logging
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,15 @@ logging.basicConfig(level=logging.INFO)
 # the first transaction.  We anchor them to a fixed base date so that
 # datetime.fromtimestamp produces meaningful wall-clock timestamps.
 _ANCHOR_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+# Dynamic CORS origins — never use "*" in production.
+_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_PRODUCTION_URL", "http://localhost:5173"
+    ).split(",")
+    if origin.strip()
+]
 
 redis_client = None
 
@@ -70,8 +80,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="FraudShield API",
     description="Real-time Fraud Detection with Persistent DB, Cache, Analytics & Alerting",
-    version="0.5.0",
+    version="1.0.0",
     lifespan=lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# CORS — dynamic origins from environment; no wildcards in production
+# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
