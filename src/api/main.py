@@ -1,13 +1,10 @@
-import sys
 import os
 import time
 import uuid
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import json
 from datetime import datetime, timezone, timedelta
 import logging
 import redis.asyncio as redis
-import src.database.init_db
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
