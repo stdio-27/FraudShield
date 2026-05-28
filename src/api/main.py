@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone, timedelta
 import logging
 import redis.asyncio as redis
+from ..database import init_db
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
