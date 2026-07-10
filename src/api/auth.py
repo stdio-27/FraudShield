@@ -9,7 +9,14 @@ from sqlalchemy.future import select
 from .database import get_db
 from .models import Analyst
 
+import logging
+
 SECRET_KEY = os.getenv("SECRET_KEY", "fraudshield-super-secret-key-dev-12345")
+if SECRET_KEY == "fraudshield-super-secret-key-dev-12345":
+    logging.warning(
+        "SECRET_KEY is using the default dev value! "
+        "Set the SECRET_KEY environment variable to a strong random string in production."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 

@@ -11,12 +11,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text, func
+from sqlalchemy import func, text
 
 from .schemas import TransactionRequest, TransactionResponse, AnalystCreate, AnalystResponse, Token
 from .services import model_manager
 from .database import engine, Base, get_db
-from .models import Transaction, FraudAlert, Analyst, RoleEnum
+from .models import Transaction, FraudAlert, Analyst, RoleEnum, AlertStatusEnum
 from .auth import hash_password, verify_password, create_access_token, get_current_active_analyst
 from .analytics import get_rolling_fraud_metrics, get_fraud_summary, get_top_at_risk_analysts
 from .alerts import evaluate_and_dispatch_alert
@@ -177,7 +177,7 @@ async def score_transaction(request: TransactionRequest, db: AsyncSession = Depe
         computed_timestamp = _ANCHOR_DATE + timedelta(seconds=request.time_seconds)
 
         # --- Extract engineered features for DB storage ---
-        df_eng = model_manager._engineer_features(req_dict).iloc[0]
+        df_eng = model_manager.engineer_features(req_dict).iloc[0]
 
         # --- Build Transaction ORM object ---
         new_tx = Transaction(
@@ -334,13 +334,13 @@ async def get_dashboard_stats(
 
     # Flagged transactions
     flagged_tx_result = await db.execute(
-        select(func.count(Transaction.tx_id)).where(Transaction.is_flagged == True)  # noqa: E712
+        select(func.count(Transaction.tx_id)).where(Transaction.is_flagged.is_(True))
     )
     flagged_tx = flagged_tx_result.scalar() or 0
 
     # Open Alerts
     open_alerts_result = await db.execute(
-        select(func.count(FraudAlert.alert_id)).where(FraudAlert.status == "open")
+        select(func.count(FraudAlert.alert_id)).where(FraudAlert.status == AlertStatusEnum.open)
     )
     open_alerts = open_alerts_result.scalar() or 0
 
