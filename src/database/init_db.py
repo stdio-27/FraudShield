@@ -23,6 +23,7 @@ from sqlalchemy.future import select
 
 from src.api.database import engine, Base, AsyncSessionLocal
 from src.api.models import Analyst, RoleEnum
+from src.api.analytics import seed_dataset_from_csv_if_needed
 from src.api.auth import hash_password
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -83,6 +84,8 @@ async def main():
     logging.info("=" * 60)
 
     await init_tables()
+    async with AsyncSessionLocal() as session:
+        await seed_dataset_from_csv_if_needed(session)
     await seed_admin()
 
     logging.info("=" * 60)

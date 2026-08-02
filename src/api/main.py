@@ -18,7 +18,12 @@ from .services import model_manager
 from .database import engine, Base, get_db
 from .models import Transaction, FraudAlert, Analyst, RoleEnum, AlertStatusEnum
 from .auth import hash_password, verify_password, create_access_token, get_current_active_analyst
-from .analytics import get_rolling_fraud_metrics, get_fraud_summary, get_top_at_risk_analysts
+from .analytics import (
+    get_rolling_fraud_metrics,
+    get_fraud_summary,
+    get_top_at_risk_analysts,
+    seed_demo_data_if_needed,
+)
 from .alerts import evaluate_and_dispatch_alert
 
 logging.basicConfig(level=logging.INFO)
@@ -327,6 +332,8 @@ async def get_dashboard_stats(
 
     if cached_stats:
         return json.loads(cached_stats)
+
+    await seed_demo_data_if_needed(db)
 
     # Total transactions
     total_tx_result = await db.execute(select(func.count(Transaction.tx_id)))
