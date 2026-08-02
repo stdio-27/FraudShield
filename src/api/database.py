@@ -3,7 +3,12 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import declarative_base
 
 # Fallback to localhost if not specified (useful for running API locally outside Docker)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost:5432/fraudshield")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:password@localhost:5433/fraudshield"
+)
+
+
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 
