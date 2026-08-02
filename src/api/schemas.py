@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from datetime import datetime
+from enum import Enum
 
 class ShapReason(BaseModel):
     feature: str
@@ -26,10 +27,15 @@ class TransactionResponse(BaseModel):
     shap_reasons: Optional[List[ShapReason]] = None
     latency_ms: int
 
+class UserRole(str,Enum):
+    analyst="analyst"
+    admin="admin"
+    readonly="readonly"
+
 class AnalystCreate(BaseModel):
     email: EmailStr
     password: str
-    role: str = "analyst"
+    role: UserRole=UserRole.analyst
 
 class AnalystResponse(BaseModel):
     analyst_id: str
