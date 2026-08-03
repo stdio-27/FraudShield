@@ -1,6 +1,6 @@
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
 
 # Retrieve DATABASE_URL from environment
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -13,7 +13,7 @@ elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("p
 
 # Create the async engine
 engine = create_async_engine(DATABASE_URL, echo=False)
-
+Base = declarative_base()
 # Create async session factory
 AsyncSessionLocal = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
@@ -22,3 +22,5 @@ AsyncSessionLocal = sessionmaker(
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
