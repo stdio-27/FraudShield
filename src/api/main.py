@@ -15,7 +15,8 @@ from sqlalchemy import func, text
 
 from .schemas import TransactionRequest, TransactionResponse, AnalystCreate, AnalystResponse, Token
 from .services import model_manager
-from .database import engine, Base, get_db
+from .database import engine, get_db
+from .models import Base
 from .models import Transaction, FraudAlert, Analyst, RoleEnum, AlertStatusEnum
 from .auth import hash_password, verify_password, create_access_token, get_current_active_analyst
 from .analytics import (
