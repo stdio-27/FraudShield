@@ -1,0 +1,46 @@
+services:
+  # 1. FastAPI Web Service
+  - type: web
+    name: fraudshield-api
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fraudshield-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: fraudshield-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEFAULT_THRESHOLD
+        value: "0.5"
+
+  # 2. React Frontend Web Service
+  - type: web
+    name: fraudshield-frontend
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: ./frontend/dist
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: fraudshield-api
+          property: url
+
+  # 3. Redis Instance
+  - type: keyvalue
+    name: fraudshield-redis
+    plan: free
+
+databases:
+  # 4. Managed PostgreSQL Instance
+  - name: fraudshield-db
+    databaseName: fraudshield
+    user: postgres
+    plan: free

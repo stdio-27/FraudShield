@@ -1,34 +1,50 @@
 version: '3.8'
 
 services:
+  # 1. Primary Database (TimescaleDB / PostgreSQL 16)
   db:
     image: timescale/timescaledb:latest-pg16
+    container_name: fraudshield_db
     environment:
       POSTGRES_DB: fraudshield
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
     ports:
-      - "5433:5432"
+      - "5433:5432" # Access externally via localhost:5433
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    networks:
+      - fraudshield_net
 
+  # 2. Database GUI (pgAdmin 4)
   pgadmin:
     image: dpage/pgadmin4
+    container_name: fraudshield_pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@fraudshield.com
       PGADMIN_DEFAULT_PASSWORD: admin
     ports:
-      - "5050:80"
+      - "5050:80" # Access via http://localhost:5050
     depends_on:
       - db
     restart: unless-stopped
+    networks:
+      - fraudshield_net
 
+  # 3. Cache & Rate Limiting (Redis)
   redis:
     image: redis:alpine
+    container_name: fraudshield_redis
     ports:
-      - "6379:6379"
+      - "6379:6379" # Access via localhost:6379
     restart: unless-stopped
+    networks:
+      - fraudshield_net
 
 volumes:
   postgres_data:
+
+networks:
+  fraudshield_net:
+    driver: bridge
