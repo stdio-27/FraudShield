@@ -1,5 +1,5 @@
 services:
-  # 1. FastAPI Web Service
+  # 1. FastAPI Web Service Backend
   - type: web
     name: fraudshield-api
     runtime: docker
@@ -20,7 +20,7 @@ services:
       - key: DEFAULT_THRESHOLD
         value: "0.5"
 
-  # 2. React Frontend Web Service
+  # 2. React Frontend Static Site
   - type: web
     name: fraudshield-frontend
     runtime: static
@@ -31,16 +31,17 @@ services:
         fromService:
           type: web
           name: fraudshield-api
-          property: url
+          property: host
 
-  # 3. Redis Instance
+  # 3. Redis Instance (Requires ipAllowList)
   - type: keyvalue
     name: fraudshield-redis
     plan: free
+    ipAllowList: [] # Allows internal private network connections only
 
 databases:
-  # 4. Managed PostgreSQL Instance
+  # 4. Managed PostgreSQL Instance (Uses non-reserved user name)
   - name: fraudshield-db
     databaseName: fraudshield
-    user: postgres
+    user: fraud_user
     plan: free
