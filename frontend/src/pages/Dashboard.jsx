@@ -1,15 +1,15 @@
-import { useState, useEffect } from 'react';
-import api from '../services/api';
-import StatCard from '../components/StatCard';
-import ChartWrapper from '../components/ChartWrapper';
-import LoadingSpinner from '../components/LoadingSpinner';
+import { useState, useEffect } from "react";
+import api from "../services/api";
+import StatCard from "../components/StatCard";
+import ChartWrapper from "../components/ChartWrapper";
+import LoadingSpinner from "../components/LoadingSpinner";
 import {
   Activity,
   DollarSign,
   ShieldAlert,
   Gauge,
   AlertTriangle,
-} from 'lucide-react';
+} from "lucide-react";
 
 export default function Dashboard() {
   const [summary, setSummary] = useState(null);
@@ -21,19 +21,25 @@ export default function Dashboard() {
     try {
       setError(null);
       const [summaryRes, tsRes] = await Promise.all([
-        api.get('/analytics/summary'),
-        api.get('/analytics/time-series?window_minutes=120'),
+        api.get("/analytics/summary"),
+        api.get("/analytics/time-series?window_minutes=120"),
       ]);
       setSummary(summaryRes.data);
       setTimeSeries(tsRes.data);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to load dashboard data');
+      setError(err.response?.data?.detail || "Failed to load dashboard data");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
+    const token = localStorage.getItem("fraudshield_token");
+    if (!token) {
+      window.location.href = "/login";
+      return;
+    }
+
     fetchData();
     // Auto-refresh every 30 seconds to pick up Redis-cached updates
     const interval = setInterval(fetchData, 30000);
@@ -48,7 +54,10 @@ export default function Dashboard() {
         <AlertTriangle className="w-10 h-10 text-amber-400" />
         <p className="text-sm text-amber-400 font-medium">{error}</p>
         <button
-          onClick={() => { setLoading(true); fetchData(); }}
+          onClick={() => {
+            setLoading(true);
+            fetchData();
+          }}
           className="px-4 py-2 rounded-lg bg-slate-800 text-sm text-slate-300 hover:bg-slate-700 transition-colors"
         >
           Retry
@@ -64,8 +73,12 @@ export default function Dashboard() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-white tracking-tight">Executive Dashboard</h2>
-          <p className="text-sm text-slate-400 mt-1">Real-time fraud detection analytics</p>
+          <h2 className="text-2xl font-bold text-white tracking-tight">
+            Executive Dashboard
+          </h2>
+          <p className="text-sm text-slate-400 mt-1">
+            Real-time fraud detection analytics
+          </p>
         </div>
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/60 border border-slate-700/40 text-xs text-slate-400">
           <div className="live-dot" />
@@ -77,7 +90,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard
           title="Total Transactions"
-          value={s.total_transactions?.toLocaleString() || '0'}
+          value={s.total_transactions?.toLocaleString() || "0"}
           icon={Activity}
           accentColor="blue"
           trend="up"
@@ -91,11 +104,11 @@ export default function Dashboard() {
         />
         <StatCard
           title="Flagged Incidents"
-          value={s.flagged_count?.toLocaleString() || '0'}
+          value={s.flagged_count?.toLocaleString() || "0"}
           subtitle={`${s.fraud_rate_pct || 0}% fraud rate`}
           icon={ShieldAlert}
           accentColor="red"
-          trend={s.flagged_count > 0 ? 'up' : 'neutral'}
+          trend={s.flagged_count > 0 ? "up" : "neutral"}
         />
         <StatCard
           title="Avg Risk Score"
