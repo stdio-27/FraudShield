@@ -3,7 +3,7 @@ services:
   - type: web
     name: fraudshield-api
     runtime: docker
-    dockerfilePath: Dockerfile
+    dockerfilePath: ./src/Dockerfile
     plan: free
     envVars:
       - key: DATABASE_URL
