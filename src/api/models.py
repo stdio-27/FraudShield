@@ -1,6 +1,6 @@
 import uuid
 import enum
-from sqlalchemy import Column, Float, Boolean, String, SmallInteger, Enum
+from sqlalchemy import Column, Float, Boolean, String, SmallInteger, Enum, Index, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from .database import Base
 
@@ -36,6 +36,8 @@ class Transaction(Base):
 
     tx_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     transaction_time = Column(TIMESTAMP(timezone=True), primary_key=True, nullable=False)
+    # Identifier supplied by the caller (may not be a UUID); tx_id is derived from it.
+    external_id = Column(String(64))
     amount = Column(Float, nullable=False)
 
     v1 = Column(Float); v2 = Column(Float); v3 = Column(Float); v4 = Column(Float)
@@ -51,6 +53,11 @@ class Transaction(Base):
     fraud_score = Column(Float)
     is_flagged = Column(Boolean, default=False)
 
+    __table_args__ = (
+        Index("ix_transactions_external_id", "external_id"),
+        Index("ix_transactions_is_flagged", "is_flagged"),
+    )
+
 
 class FraudAlert(Base):
     __tablename__ = "fraud_alerts"
@@ -60,7 +67,13 @@ class FraudAlert(Base):
     fraud_score = Column(Float)
     shap_reasons = Column(JSONB)
     status = Column(Enum(AlertStatusEnum), default=AlertStatusEnum.open)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    # We omit a strict DB-level foreign key constraint here to bypass SQLAlchemy's
-    # complexity with composite foreign keys mapped to TimescaleDB hypertables,
-    # but logically tx_id maps to transactions.tx_id.
+    # No DB-level foreign key: tx_id is only part of the composite primary key
+    # of the transactions hypertable, so the relationship is enforced logically.
+
+    __table_args__ = (
+        Index("ix_fraud_alerts_status", "status"),
+        Index("ix_fraud_alerts_tx_id", "tx_id"),
+        Index("ix_fraud_alerts_created_at", "created_at"),
+    )

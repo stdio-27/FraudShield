@@ -1,97 +1,83 @@
 """
-init_db.py — Standalone database initialization and seeding script.
+init_db.py — database initialisation and seeding.
 
-Run from the project root with PYTHONPATH=. :
-    python src/database/init_db.py
+Run from the project root:
+    python -m src.database.init_db                 # schema + admin + dataset import
+    python -m src.database.init_db --skip-dataset  # schema + admin only
+    python -m src.database.init_db --replace-dataset --limit 0   # re-import the whole CSV
 
-This script:
-  1. Creates all SQLAlchemy ORM tables in the target PostgreSQL/Supabase database.
-  2. Attempts to convert 'transactions' into a TimescaleDB hypertable.
-  3. Seeds a default admin analyst account for first-time login.
+Environment (usually in .env):
+    SEED_ADMIN_EMAIL, SEED_ADMIN_PASSWORD   required to create the first admin
+                                            (no defaults: there is no built-in login)
+    DATASET_IMPORT_LIMIT                    rows to import (default 2000, 0 = all)
 """
 
-import os
-import sys
+import argparse
 import asyncio
 import logging
+import os
+import sys
 
-# Ensure project root is on the path so that `src.api.*` imports resolve
+# Allow `python src/database/init_db.py` as well as `python -m src.database.init_db`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from sqlalchemy import text
 from sqlalchemy.future import select
 
-from src.api.database import engine, Base, AsyncSessionLocal
+from src.api import config  # noqa: F401  (loads .env)
+from src.api.auth import get_analyst_by_email, hash_password
+from src.api.database import AsyncSessionLocal, engine
+from src.api.db_bootstrap import init_schema
 from src.api.models import Analyst, RoleEnum
-from src.api.analytics import seed_dataset_from_csv_if_needed
-from src.api.auth import hash_password
+from src.database.seed import seed_dataset_if_empty
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("fraudshield.init_db")
 
-# Default seed analyst — change password in production via env var
-SEED_EMAIL = os.getenv("SEED_ADMIN_EMAIL", "admin@fraudshield.com")
-SEED_PASSWORD = os.getenv("SEED_ADMIN_PASSWORD", "FraudShield2025!")
+MIN_PASSWORD_LENGTH = 12
 
 
-async def init_tables():
-    """Create all ORM tables and configure TimescaleDB hypertable."""
-    logging.info("Creating database tables...")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        logging.info("All tables created successfully.")
+async def seed_admin() -> None:
+    email = (os.getenv("SEED_ADMIN_EMAIL") or "").strip().lower()
+    password = os.getenv("SEED_ADMIN_PASSWORD") or ""
 
-        # TimescaleDB hypertable (gracefully skipped if extension is missing)
-        try:
-            await conn.execute(text(
-                "SELECT create_hypertable('transactions', 'transaction_time', if_not_exists => TRUE);"
-            ))
-            logging.info("TimescaleDB hypertable configured for 'transactions'.")
-        except Exception as e:
-            logging.warning(f"Hypertable setup skipped (extension may not be available): {e}")
-
-        try:
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_transactions_time ON transactions (transaction_time DESC);"
-            ))
-            logging.info("Time-series index created.")
-        except Exception as e:
-            logging.warning(f"Index creation note: {e}")
-
-
-async def seed_admin():
-    """Seed a default admin analyst if one does not already exist."""
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Analyst).where(Analyst.email == SEED_EMAIL))
-        existing = result.scalars().first()
-
-        if existing:
-            logging.info(f"Admin analyst '{SEED_EMAIL}' already exists — skipping seed.")
-            return
-
-        admin = Analyst(
-            email=SEED_EMAIL,
-            password_hash=hash_password(SEED_PASSWORD),
-            role=RoleEnum.admin,
+    if not email or not password:
+        logger.warning(
+            "SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD not set; no admin account created. "
+            "Set both (and re-run) to create the first admin."
         )
-        session.add(admin)
-        await session.commit()
-        logging.info(f"Seeded admin analyst: {SEED_EMAIL}")
+        return
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise SystemExit(f"SEED_ADMIN_PASSWORD must be at least {MIN_PASSWORD_LENGTH} characters.")
 
-
-async def main():
-    logging.info("=" * 60)
-    logging.info("FraudShield — Database Initialization")
-    logging.info("=" * 60)
-
-    await init_tables()
     async with AsyncSessionLocal() as session:
-        await seed_dataset_from_csv_if_needed(session)
-    await seed_admin()
+        if await get_analyst_by_email(session, email):
+            logger.info("Admin analyst '%s' already exists; skipping.", email)
+            return
+        session.add(Analyst(email=email, password_hash=hash_password(password), role=RoleEnum.admin))
+        await session.commit()
+        logger.info("Seeded admin analyst: %s", email)
 
-    logging.info("=" * 60)
-    logging.info("Database initialization complete. analysts table seeded.")
-    logging.info("=" * 60)
+
+async def main(skip_dataset: bool, limit, replace: bool) -> None:
+    logger.info("Initialising database schema...")
+    await init_schema(engine)
+    await seed_admin()
+    if not skip_dataset:
+        await seed_dataset_if_empty(limit=limit, replace=replace)
+    await engine.dispose()
+    logger.info("Database initialisation complete.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Initialise and seed the FraudShield database.")
+    parser.add_argument("--skip-dataset", action="store_true", help="do not import creditcard.csv")
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="rows of creditcard.csv to import; 0 = the whole file (default: DATASET_IMPORT_LIMIT, then 2000)",
+    )
+    parser.add_argument(
+        "--replace-dataset", action="store_true",
+        help="delete previously imported dataset rows (and their alerts) first, then re-import; "
+             "transactions scored through the API are kept",
+    )
+    args = parser.parse_args()
+    asyncio.run(main(args.skip_dataset, args.limit, args.replace_dataset))

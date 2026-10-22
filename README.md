@@ -88,8 +88,10 @@ cd FraudShield
 
 ## 2. Create Virtual Environment
 
+Use Python 3.11 or 3.12 (the Docker image uses 3.12).
+
 ```bash
-python3 -m venv shieldenv
+python3 -m venv .venv
 ```
 
 Activate
@@ -97,13 +99,13 @@ Activate
 ### macOS / Linux
 
 ```bash
-source shieldenv/bin/activate
+source .venv/bin/activate
 ```
 
 ### Windows
 
 ```bash
-shieldenv\Scripts\activate
+.venv\Scripts\activate
 ```
 
 ---
@@ -112,6 +114,12 @@ shieldenv\Scripts\activate
 
 ```bash
 pip install -r requirements.txt
+```
+
+Only needed if you retrain the model:
+
+```bash
+pip install -r requirements-train.txt
 ```
 
 ---
@@ -127,27 +135,23 @@ npm install
 
 # Environment Variables
 
-Create a `.env` file in the project root.
+Copy `.env.example` to `.env` in the project root and fill it in. The API and
+`docker compose` both read this file. The important values:
 
-Example:
-
-```env
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/fraudshield
-
-REDIS_URL=redis://localhost:6379
-
-SECRET_KEY=your-secret-key
-
-FRONTEND_PRODUCTION_URL=http://localhost:5173
-
-ALERT_THRESHOLD=0.85
-```
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Required. Compose publishes the DB on `localhost:5433`. |
+| `POSTGRES_PASSWORD`, `PGADMIN_PASSWORD` | Required by `docker compose`. |
+| `SECRET_KEY` | JWT signing key (>= 32 chars). Mandatory when `APP_ENV=production`; in development a random per-process key is used if unset. |
+| `SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD` | First admin account (password >= 12 chars). There is no built-in default login. |
+| `SCORING_API_KEY` | Optional key for machine clients of `POST /transactions/score` (`X-API-Key` header). |
+| `REDIS_URL` | Optional; the API works without Redis (uncached, per-process rate limits). |
 
 ---
 
 # Start Infrastructure
 
-Run Docker services:
+Run Docker services (ports are bound to `127.0.0.1` only):
 
 ```bash
 docker compose up -d
@@ -155,10 +159,53 @@ docker compose up -d
 
 This starts
 
-- PostgreSQL
-- TimescaleDB
-- Redis
-- pgAdmin
+- PostgreSQL + TimescaleDB (`localhost:5433`)
+- Redis (`localhost:6379`)
+- pgAdmin (`http://localhost:5050`)
+
+---
+
+# Train the Model
+
+The repository's `models/` artifacts must be a consistent set. If the API
+reports `artifacts_loaded: false` at `/health` (for example "Scaler was fitted
+on 2 features"), retrain. This needs the dataset (see below) and
+`requirements-train.txt`:
+
+```bash
+python -m src.ml.train
+```
+
+This writes `xgboost_fraud_model.json`, `scaler.joblib`, `amount_stats.json`
+and `feature_manifest.json` (feature order, F1-optimal decision threshold,
+SHA-256 of each artifact) to `models/`.
+
+---
+
+# Initialise the Database
+
+Creates the tables, the first admin (from `SEED_ADMIN_*`) and imports the first
+`DATASET_IMPORT_LIMIT` rows of the dataset (timestamps are shifted so the last
+row is "now"):
+
+```bash
+python -m src.database.init_db
+```
+
+Use `--skip-dataset` to skip the import. Importing never happens implicitly
+inside API requests.
+
+To load a different amount later (e.g. the whole 284,807-row file), re-import
+with `--replace-dataset`. It deletes only previously imported dataset rows (and
+their alerts), keeps anything scored through the API, and works in chunks so
+memory stays flat:
+
+```bash
+python -m src.database.init_db --replace-dataset --limit 0
+```
+
+`DATASET_IMPORT_LIMIT` only controls how much data is loaded for dashboard
+testing. Training (`python -m src.ml.train`) always uses the entire CSV.
 
 ---
 
@@ -202,14 +249,9 @@ http://localhost:5173
 
 Download the Credit Card Fraud Detection dataset from Kaggle.
 
-Place the file as
-
-```
-data/
-    creditcard.csv
-```
-
-On first startup, the application automatically imports the dataset into PostgreSQL if the transaction table is empty.
+Place the file as `data/creditcard.csv` (or in the project root, or point
+`DATASET_PATH` at it). It is used by `python -m src.ml.train` and
+`python -m src.database.init_db`.
 
 ---
 
@@ -235,19 +277,9 @@ fraudshield
 http://localhost:5050
 ```
 
-Default credentials
-
-Email
-
-```
-admin@fraudshield.com
-```
-
-Password
-
-```
-admin
-```
+Log in with `PGADMIN_DEFAULT_EMAIL` and `PGADMIN_DEFAULT_PASSWORD` from your
+`.env`. pgAdmin only reads them when its data volume is first created; after
+changing them, run `docker compose down -v` and `docker compose up -d`.
 
 ---
 
@@ -280,6 +312,12 @@ Returns
 
 The frontend stores the JWT in Local Storage and automatically attaches it to authenticated requests.
 
+- `POST /auth/register` is **admin-only** (bearer token of an admin); there is no self-service sign-up.
+- Login is rate limited (`LOGIN_MAX_ATTEMPTS` per `LOGIN_WINDOW_SECONDS`, default 5 per 15 min).
+- `POST /transactions/score` requires either an `X-API-Key: <SCORING_API_KEY>` header or an analyst/admin bearer token. It is idempotent on `transaction_id` and accepts an optional `transaction_time` (defaults to receipt time).
+- Alerts: `GET /alerts?status=open,investigating&limit=50&offset=0` and `PATCH /alerts/{id}` (`{"status": "investigating"}`). Items include the top-5 SHAP `shap_reasons` plus the transaction's `amount`, `transaction_time` and `external_id`.
+- `GET /health` returns 503 until the model artifacts are loaded and the database answers.
+
 ---
 
 # Dashboard
@@ -297,12 +335,15 @@ The analytics dashboard includes
 
 # Machine Learning Pipeline
 
-1. Load trained XGBoost model
-2. Engineer transaction features
-3. Predict fraud probability
-4. Generate SHAP explanations
+1. Load trained XGBoost model, scaler and manifest (validated at startup)
+2. Engineer transaction features (`src/ml/features.py`, shared with training)
+3. Predict fraud probability; flag at the threshold from `feature_manifest.json`
+4. Generate SHAP explanations for flagged transactions
 5. Store prediction in database
-6. Generate alerts for high-risk transactions
+6. Create alerts for flagged transactions; fire the webhook at `ALERT_THRESHOLD`
+
+Without the TimescaleDB extension (e.g. Render's managed Postgres) the
+dashboard buckets use PostgreSQL's `date_bin`.
 
 ---
 

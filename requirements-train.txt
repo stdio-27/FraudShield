@@ -1,0 +1,3 @@
+# Extra dependencies needed only to retrain the model (python -m src.ml.train)
+-r requirements.txt
+imbalanced-learn>=0.14,<0.15

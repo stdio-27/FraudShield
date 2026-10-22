@@ -1,18 +1,20 @@
-fastapi
-uvicorn[standard]
-pydantic[email]
-python-jose[cryptography]
-passlib[bcrypt]
-numpy
-pandas
-scikit-learn
-imbalanced-learn
-xgboost
-shap
-psycopg2-binary
-asyncpg
-sqlalchemy
-redis
-httpx
-joblib
-python-multipart
+# Serving dependencies, pinned to the versions the code and the committed model artifacts
+# were tested with.  scikit-learn / xgboost / shap are pickle- and format-sensitive across
+# minor versions: if you bump them, retrain (python -m src.ml.train).  Requires Python >= 3.12.
+fastapi>=0.149,<0.150
+uvicorn[standard]>=0.48,<0.49
+pydantic[email]>=2.14,<3
+python-multipart>=0.0.32,<0.1
+python-jose[cryptography]>=3.5,<4
+bcrypt>=5.0,<6
+python-dotenv>=1.2,<2
+sqlalchemy[asyncio]>=2.1.5,<2.2
+asyncpg>=0.32,<0.33
+redis>=8.1,<9
+httpx>=0.28,<0.29
+numpy>=2.5,<2.6
+pandas>=3.0,<3.1
+scikit-learn>=1.9,<1.10
+xgboost>=3.4,<3.5
+shap>=0.54,<0.55
+joblib>=1.6,<2

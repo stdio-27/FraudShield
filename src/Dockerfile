@@ -4,30 +4,32 @@
 #  Run:    docker run -p 8000:8000 --env-file .env fraudshield-api
 # ──────────────────────────────────────────────────────────────
 
-FROM python:3.11-slim AS base
+FROM python:3.12-slim
 
-# Prevent Python from writing .pyc and enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    APP_ENV=production \
+    FORWARDED_ALLOW_IPS="*"
 
 WORKDIR /app
 
-# ── Install system dependencies for psycopg2 and bcrypt ──
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libpq-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# ── Install Python dependencies ──
+# ── Python dependencies (all pure wheels; no compiler or libpq needed) ──
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# ── Copy application source and model artifacts ──
+# ── Application source and model artifacts ──
 COPY src/ ./src/
 COPY models/ ./models/
 
-# ── Expose the API port ──
+# ── Run unprivileged ──
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
+
 EXPOSE 8000
 
-# ── Launch with uvicorn (production workers) ──
-CMD ["sh", "-c", "uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8000'), timeout=4)" || exit 1
+
+# WEB_CONCURRENCY sets the worker count (default 1; each worker loads the model into memory).
+CMD ["sh", "-c", "uvicorn src.api.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"]

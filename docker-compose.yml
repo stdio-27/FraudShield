@@ -1,5 +1,5 @@
-version: '3.8'
-
+# Local development infrastructure.  Credentials come from the project-root .env
+# (see .env.example); ports are published on loopback only.
 services:
   # 1. Primary Database (TimescaleDB / PostgreSQL 16)
   db:
@@ -8,9 +8,9 @@ services:
     environment:
       POSTGRES_DB: fraudshield
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "5433:5432" # Access externally via localhost:5433
+      - "127.0.0.1:5433:5432" # Access via localhost:5433
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -22,10 +22,10 @@ services:
     image: dpage/pgadmin4
     container_name: fraudshield_pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@fraudshield.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:?Set PGADMIN_DEFAULT_EMAIL in .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?Set PGADMIN_DEFAULT_PASSWORD in .env}
     ports:
-      - "5050:80" # Access via http://localhost:5050
+      - "127.0.0.1:5050:80" # Access via http://localhost:5050
     depends_on:
       - db
     restart: unless-stopped
@@ -37,7 +37,7 @@ services:
     image: redis:alpine
     container_name: fraudshield_redis
     ports:
-      - "6379:6379" # Access via localhost:6379
+      - "127.0.0.1:6379:6379" # Access via localhost:6379
     restart: unless-stopped
     networks:
       - fraudshield_net

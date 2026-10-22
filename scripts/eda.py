@@ -36,5 +36,9 @@ def run_eda(filepath: str):
         print("Error: 'Class' column not found in dataset.")
 
 if __name__ == "__main__":
-    dataset_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'creditcard.csv')
-    run_eda(dataset_path)
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    from src.ml.dataset import resolve_dataset_path
+
+    run_eda(resolve_dataset_path() or os.path.join("data", "creditcard.csv"))

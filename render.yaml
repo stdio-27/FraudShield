@@ -5,7 +5,10 @@ services:
     runtime: docker
     dockerfilePath: ./src/Dockerfile
     plan: free
+    healthCheckPath: /health
     envVars:
+      - key: APP_ENV
+        value: production
       - key: DATABASE_URL
         fromDatabase:
           name: fraudshield-db
@@ -15,10 +18,20 @@ services:
           type: keyvalue
           name: fraudshield-redis
           property: connectionString
-      - key: JWT_SECRET
+      # Read by src/api/auth.py (the app refuses to start in production without it)
+      - key: SECRET_KEY
         generateValue: true
-      - key: DEFAULT_THRESHOLD
-        value: "0.5"
+      # Key for machine clients calling POST /transactions/score via the X-API-Key header
+      - key: SCORING_API_KEY
+        generateValue: true
+      # Optional override; defaults to the threshold stored in models/feature_manifest.json
+      - key: DECISION_THRESHOLD
+        sync: false
+      # Public URL of the frontend (exact origin, e.g. https://fraudshield.vercel.app)
+      - key: FRONTEND_PRODUCTION_URL
+        sync: false
+      - key: ALERT_WEBHOOK_URL
+        sync: false
 
   # 2. React Frontend Static Site
   - type: web
@@ -27,20 +40,19 @@ services:
     buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: ./frontend/dist
     envVars:
-      - key: VITE_API_URL
-        fromService:
-          type: web
-          name: fraudshield-api
-          property: host
+      # Full public URL of fraudshield-api, e.g. https://fraudshield-api.onrender.com
+      # (Render's `host` property is an internal hostname without a scheme, so set this by hand.)
+      - key: VITE_API_BASE_URL
+        sync: false
 
-  # 3. Redis Instance (Requires ipAllowList)
+  # 3. Redis Instance
   - type: keyvalue
     name: fraudshield-redis
     plan: free
-    ipAllowList: [] # Allows internal private network connections only
+    ipAllowList: [] # internal private network connections only
 
 databases:
-  # 4. Managed PostgreSQL Instance (Uses non-reserved user name)
+  # 4. Managed PostgreSQL (no TimescaleDB: analytics fall back to date_bin bucketing)
   - name: fraudshield-db
     databaseName: fraudshield
     user: fraud_user

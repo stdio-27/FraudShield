@@ -1,144 +1,276 @@
-import os
+import hashlib
 import json
-import joblib
-import xgboost as xgb
-import pandas as pd
-import numpy as np
 import logging
-from typing import List, Tuple, Any
+import os
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import joblib
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+from ..ml.features import FEATURE_COLUMNS, engineer_features
+
+logger = logging.getLogger(__name__)
+
+MODEL_FILE = "xgboost_fraud_model.json"
+SCALER_FILE = "scaler.joblib"
+STATS_FILE = "amount_stats.json"
+MANIFEST_FILE = "feature_manifest.json"
+
+DEFAULT_THRESHOLD = 0.5
+
+
+@dataclass
+class ScoreResult:
+    fraud_score: float
+    is_flagged: bool
+    decision: str
+    shap_reasons: Optional[List[Dict[str, Any]]]
+    hour_of_day: int
+    amount_zscore: float
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ModelManager:
-    """Singleton class to manage ML model artifacts to avoid disk I/O on every request."""
+    """Singleton holding the ML artifacts so they are loaded once, not per request."""
+
     _instance = None
 
-    model: xgb.XGBClassifier = None
-    explainer = None
-    scaler = None
-
-    # Fallback training set parameters for Amount Z-score.
-    # These are overridden at runtime if models/amount_stats.json exists.
-    AMOUNT_MEAN = 88.3496
-    AMOUNT_STD = 250.1201
+    # Training-set Amount statistics used only when amount_stats.json is missing.
+    FALLBACK_AMOUNT_MEAN = 88.3496
+    FALLBACK_AMOUNT_STD = 250.1201
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(ModelManager, cls).__new__(cls)
+            inst = super().__new__(cls)
+            inst.model = None
+            inst.explainer = None
+            inst.scaler = None
+            inst.amount_mean = cls.FALLBACK_AMOUNT_MEAN
+            inst.amount_std = cls.FALLBACK_AMOUNT_STD
+            inst.threshold = DEFAULT_THRESHOLD
+            inst.load_error = None
+            inst._ready = False
+            inst._load_lock = threading.Lock()
+            inst._infer_lock = threading.Lock()
+            cls._instance = inst
         return cls._instance
 
-    def load_artifacts(self, models_dir: str):
-        """Loads artifacts into memory if not already loaded."""
-        if self.model is None:
-            logging.info("Loading XGBoost model...")
-            self.model = xgb.XGBClassifier()
-            self.model.load_model(os.path.join(models_dir, "xgboost_fraud_model.json"))
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
 
-            logging.info("Loading SHAP Explainer...")
-            self.explainer = joblib.load(os.path.join(models_dir, "shap_explainer.pkl"))
+    # ------------------------------------------------------------------ loading
+    def load_artifacts(self, models_dir: str) -> None:
+        """Load and cross-validate every artifact.  Raises on any inconsistency."""
+        with self._load_lock:
+            if self._ready:
+                return
+            try:
+                self._load(models_dir)
+            except Exception as exc:
+                self.load_error = str(exc)
+                self._ready = False
+                raise
+            self.load_error = None
+            self._ready = True
 
-            logging.info("Loading Scaler...")
-            self.scaler = joblib.load(os.path.join(models_dir, "scaler.joblib"))
+    def _load(self, models_dir: str) -> None:
+        model_path = os.path.join(models_dir, MODEL_FILE)
+        scaler_path = os.path.join(models_dir, SCALER_FILE)
+        for path in (model_path, scaler_path):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Missing model artifact: {path}. Run `python -m src.ml.train`.")
 
-            # Load amount stats dynamically if available (fixes hardcoded skew)
-            stats_path = os.path.join(models_dir, "amount_stats.json")
-            if os.path.exists(stats_path):
-                with open(stats_path, "r") as f:
-                    stats = json.load(f)
-                self.AMOUNT_MEAN = stats["mean"]
-                self.AMOUNT_STD = stats["std"]
-                logging.info(f"Loaded amount stats: mean={self.AMOUNT_MEAN}, std={self.AMOUNT_STD}")
-            else:
-                logging.warning(
-                    f"amount_stats.json not found in {models_dir}. "
-                    f"Using hardcoded fallbacks: mean={self.AMOUNT_MEAN}, std={self.AMOUNT_STD}"
+        manifest = self._read_manifest(models_dir)
+        stats_path = os.path.join(models_dir, STATS_FILE)
+        if manifest and "artifacts" in manifest:
+            self._verify_hashes(models_dir, manifest["artifacts"])
+        else:
+            logger.warning("No %s found; skipping artifact integrity check.", MANIFEST_FILE)
+
+        if manifest and manifest.get("feature_columns") not in (None, FEATURE_COLUMNS):
+            raise RuntimeError("feature_manifest.json feature_columns do not match the serving code.")
+
+        logger.info("Loading XGBoost model...")
+        model = xgb.XGBClassifier()
+        model.load_model(model_path)
+
+        logger.info("Loading scaler...")
+        scaler = joblib.load(scaler_path)
+
+        n_features = len(FEATURE_COLUMNS)
+        scaler_features = getattr(scaler, "n_features_in_", None)
+        if scaler_features != n_features:
+            raise RuntimeError(
+                f"Scaler was fitted on {scaler_features} features but the serving pipeline "
+                f"produces {n_features}. The artifacts are stale or from a different pipeline; "
+                "retrain with `python -m src.ml.train`."
+            )
+        scaler_names = getattr(scaler, "feature_names_in_", None)
+        if scaler_names is not None and list(scaler_names) != FEATURE_COLUMNS:
+            raise RuntimeError("Scaler feature names/order differ from FEATURE_COLUMNS; retrain the model.")
+
+        model_features = self._model_feature_count(model)
+        if model_features is not None and model_features != n_features:
+            raise RuntimeError(
+                f"Model expects {model_features} features but the serving pipeline produces {n_features}."
+            )
+
+        if os.path.isfile(stats_path):
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+            self.amount_mean, self.amount_std = float(stats["mean"]), float(stats["std"])
+            logger.info("Loaded amount stats: mean=%s, std=%s", self.amount_mean, self.amount_std)
+        else:
+            self.amount_mean = self.FALLBACK_AMOUNT_MEAN
+            self.amount_std = self.FALLBACK_AMOUNT_STD
+            logger.warning("%s not found; using fallback amount statistics.", STATS_FILE)
+
+        self.threshold = self._resolve_threshold(manifest)
+        logger.info("Decision threshold: %.4f", self.threshold)
+
+        self.model = model
+        self.scaler = scaler
+        self.explainer = self._build_explainer(model)
+        logger.info("All model artifacts loaded successfully.")
+
+    @staticmethod
+    def _read_manifest(models_dir: str) -> Optional[dict]:
+        path = os.path.join(models_dir, MANIFEST_FILE)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _verify_hashes(models_dir: str, expected: Dict[str, str]) -> None:
+        for name, digest in expected.items():
+            path = os.path.join(models_dir, name)
+            if not os.path.isfile(path):
+                raise RuntimeError(f"Manifest lists {name} but the file is missing.")
+            if _sha256(path) != digest:
+                raise RuntimeError(
+                    f"Integrity check failed for {name}: it does not match feature_manifest.json "
+                    "(artifacts were modified or are from different training runs)."
                 )
 
-            logging.info("All model artifacts loaded successfully into memory.")
+    @staticmethod
+    def _model_feature_count(model: xgb.XGBClassifier) -> Optional[int]:
+        try:
+            return int(model.get_booster().num_features())
+        except Exception:
+            return None
 
-    def engineer_features(self, req_data: dict) -> pd.DataFrame:
-        """Transforms raw request into the exact DataFrame features expected by the model."""
-        amount = req_data['amount']
-        time_sec = req_data['time_seconds']
+    @staticmethod
+    def _resolve_threshold(manifest: Optional[dict]) -> float:
+        env_value = os.getenv("DECISION_THRESHOLD") or os.getenv("DEFAULT_THRESHOLD")
+        if env_value:
+            try:
+                value = float(env_value)
+                if 0.0 < value < 1.0:
+                    return value
+                logger.warning("Ignoring out-of-range DECISION_THRESHOLD=%s", env_value)
+            except ValueError:
+                logger.warning("Ignoring non-numeric DECISION_THRESHOLD=%s", env_value)
+        if manifest and manifest.get("decision_threshold") is not None:
+            return float(manifest["decision_threshold"])
+        return DEFAULT_THRESHOLD
 
-        feature_dict = {f"V{i}": req_data[f"v{i}"] for i in range(1, 29)}
-        feature_dict["Amount"] = amount
+    @staticmethod
+    def _build_explainer(model: xgb.XGBClassifier):
+        """Rebuilt from the model (no pickle).  Scoring still works without SHAP."""
+        try:
+            import shap
 
-        # Derived features
-        hour_of_day = (time_sec / 3600) % 24
-        # Fix: round before int comparison to avoid floating-point precision bugs
-        day_of_week = int(round((time_sec // 86400) % 7))
-        is_weekend = int(day_of_week in [5, 6])
-        amount_zscore = (amount - self.AMOUNT_MEAN) / self.AMOUNT_STD
-        amount_log = np.log1p(amount)
-        high_value_flag = int(amount > 1000)
+            return shap.TreeExplainer(model)
+        except Exception as exc:
+            logger.error("SHAP explainer unavailable; explanations disabled: %s", exc)
+            return None
 
-        feature_dict.update({
-            "hour_of_day": hour_of_day,
-            "is_weekend": is_weekend,
-            "amount_zscore": amount_zscore,
-            "amount_log": amount_log,
-            "high_value_flag": high_value_flag
-        })
+    # --------------------------------------------------------------- inference
+    def engineer_features(self, raw: pd.DataFrame) -> pd.DataFrame:
+        return engineer_features(raw, self.amount_mean, self.amount_std)
 
-        # Strict order to match training DataFrame columns
-        ordered_cols = [f"V{i}" for i in range(1, 29)] + [
-            "Amount", "hour_of_day", "is_weekend",
-            "amount_zscore", "amount_log", "high_value_flag"
-        ]
+    @staticmethod
+    def frame_from_request(req_data: dict) -> pd.DataFrame:
+        row = {"Time": req_data["time_seconds"], "Amount": req_data["amount"]}
+        for i in range(1, 29):
+            row[f"V{i}"] = req_data[f"v{i}"]
+        return pd.DataFrame([row])
 
-        return pd.DataFrame([feature_dict])[ordered_cols]
+    def score(self, req_data: dict) -> ScoreResult:
+        """Score a single request payload (keys: amount, time_seconds, v1..v28)."""
+        return self.score_frame(self.frame_from_request(req_data))[0]
 
-    def predict(self, req_data: dict, threshold: float = 0.5) -> Tuple[float, bool, str, Any]:
-        """Runs the complete inference and explainability pipeline."""
-        df_engineered = self.engineer_features(req_data)
+    def score_frame(self, raw: pd.DataFrame) -> List[ScoreResult]:
+        """
+        Score a raw frame with ``Time``, ``Amount`` and ``V1``..``V28`` columns.
+        Blocking and CPU-bound: call it from a worker thread, never the event loop.
+        """
+        if not self._ready:
+            raise RuntimeError("Model artifacts are not loaded.")
 
-        # Scale
-        df_scaled = pd.DataFrame(self.scaler.transform(df_engineered), columns=df_engineered.columns)
+        features = self.engineer_features(raw)
+        with self._infer_lock:
+            scaled = pd.DataFrame(self.scaler.transform(features), columns=FEATURE_COLUMNS)
+            probas = self.model.predict_proba(scaled)[:, 1]
+            flagged_idx = [i for i, p in enumerate(probas) if p >= self.threshold]
+            reasons = self._explain(scaled, flagged_idx)
 
-        # Predict Proba
-        probas = self.model.predict_proba(df_scaled)
-        fraud_score = float(probas[0, 1])
+        results = []
+        for i, proba in enumerate(probas):
+            flagged = float(proba) >= self.threshold
+            results.append(
+                ScoreResult(
+                    fraud_score=float(proba),
+                    is_flagged=flagged,
+                    decision="REVIEW" if flagged else "APPROVE",
+                    shap_reasons=reasons.get(i),
+                    hour_of_day=int(features["hour_of_day"].iloc[i]),
+                    amount_zscore=float(features["amount_zscore"].iloc[i]),
+                )
+            )
+        return results
 
-        is_flagged = fraud_score > threshold
-        decision = "REVIEW" if is_flagged else "APPROVE"
-
-        shap_reasons = None
-        if is_flagged:
-            # SHAP calculation for the single flagged transaction
-            shap_vals = self.explainer.shap_values(df_scaled)
-
-            # xgboost binary classification often returns a single array or list of arrays
+    def _explain(self, scaled: pd.DataFrame, indices: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+        """Top-5 SHAP attributions for the given row indices (only flagged rows pay this cost)."""
+        if not indices or self.explainer is None:
+            return {}
+        try:
+            shap_vals = self.explainer.shap_values(scaled.iloc[indices])
             if isinstance(shap_vals, list):
-                shap_vals = shap_vals[1]  # positive class
+                shap_vals = shap_vals[1]
+            shap_vals = np.asarray(shap_vals)
+            if shap_vals.ndim == 3:
+                shap_vals = shap_vals[:, :, -1]
 
-            sample_shap = shap_vals[0]
-
-            feature_impacts = []
-            for i, col in enumerate(df_scaled.columns):
-                val = float(sample_shap[i])
-                feature_impacts.append({
-                    "feature": col,
-                    "score": abs(val),
-                    "raw_score": val,
-                    "direction": "INCREASE RISK" if val > 0 else "DECREASE RISK"
-                })
-
-            # Sort by absolute impact and take top 5
-            feature_impacts.sort(key=lambda x: x["score"], reverse=True)
-            top_5 = feature_impacts[:5]
-
-            shap_reasons = []
-            for item in top_5:
-                shap_reasons.append({
-                    "feature": item["feature"],
-                    "attribution_score": item["score"],
-                    "direction": item["direction"]
-                })
-
-        return fraud_score, is_flagged, decision, shap_reasons
+            out = {}
+            for row, idx in enumerate(indices):
+                sample = shap_vals[row]
+                order = np.argsort(-np.abs(sample))[:5]
+                out[idx] = [
+                    {
+                        "feature": FEATURE_COLUMNS[j],
+                        "attribution_score": float(abs(sample[j])),
+                        "direction": "INCREASE RISK" if sample[j] > 0 else "DECREASE RISK",
+                    }
+                    for j in order
+                ]
+            return out
+        except Exception as exc:
+            logger.error("SHAP explanation failed; returning score without reasons: %s", exc)
+            return {}
 
 
 model_manager = ModelManager()

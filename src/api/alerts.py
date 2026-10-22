@@ -1,89 +1,108 @@
 """
 alerts.py — Real-time asynchronous alert evaluation and webhook dispatch.
 
-When a scored transaction exceeds a high-confidence risk threshold, this
-module fires a non-blocking webhook notification to an external receiver
-(e.g., Slack, PagerDuty, or an internal SOC dashboard) so that the primary
-/transactions/score response is never delayed by network latency.
+When a scored transaction reaches the high-confidence threshold, a webhook is
+posted to an external receiver (Slack, PagerDuty, SOC dashboard, ...) from a
+background task so /transactions/score is never delayed by network latency.
+Every flagged transaction is still persisted as a FraudAlert row regardless.
 """
 
-import os
 import asyncio
 import logging
+import os
 from typing import Optional
+from urllib.parse import urlparse
+
 import httpx
 
-logging.basicConfig(level=logging.INFO)
+from . import config
 
-# Configurable via environment variable; defaults to None (disabled).
-ALERT_WEBHOOK_URL: Optional[str] = os.getenv("ALERT_WEBHOOK_URL")
+logger = logging.getLogger(__name__)
 
-# Risk threshold above which a webhook alert is fired.
-HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv("ALERT_THRESHOLD", "0.85"))
+ALERT_WEBHOOK_URL: Optional[str] = os.getenv("ALERT_WEBHOOK_URL") or None
+if ALERT_WEBHOOK_URL and urlparse(ALERT_WEBHOOK_URL).scheme not in ("http", "https"):
+    logger.error("ALERT_WEBHOOK_URL must be an http(s) URL; webhook alerts disabled.")
+    ALERT_WEBHOOK_URL = None
+
+# fraud_score at or above this value fires a webhook.
+HIGH_CONFIDENCE_THRESHOLD: float = config.env_float("ALERT_THRESHOLD", 0.85)
+CRITICAL_THRESHOLD: float = 0.95
+
+_MAX_ATTEMPTS = 3
+_client: Optional[httpx.AsyncClient] = None
+# Strong references: the event loop only keeps weak ones, so an unreferenced
+# fire-and-forget task can be garbage-collected before it completes.
+_background_tasks: set = set()
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=10.0)
+    return _client
+
+
+async def close_client() -> None:
+    """Drain in-flight webhooks (briefly) and close the shared HTTP client."""
+    global _client
+    if _background_tasks:
+        await asyncio.wait(list(_background_tasks), timeout=5)
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+def _safe_target() -> str:
+    parsed = urlparse(ALERT_WEBHOOK_URL or "")
+    return parsed.netloc or "unknown"  # never log the path: it often embeds a secret token
 
 
 async def _dispatch_webhook(payload: dict) -> None:
-    """
-    Posts the structured alert payload to the configured webhook URL.
-    Wrapped in its own coroutine so it can be launched as a fire-and-forget
-    background task via ``asyncio.create_task()``.
-
-    Retry strategy: single attempt with a generous 10-second timeout.
-    Failures are logged but never propagate back to the caller.
-    """
+    """POST the alert, retrying transient failures. Never raises."""
     if not ALERT_WEBHOOK_URL:
-        logging.debug("ALERT_WEBHOOK_URL is not configured — skipping webhook dispatch.")
         return
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(ALERT_WEBHOOK_URL, json=payload)
+    tx_id = payload.get("tx_id")
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            response = await _get_client().post(ALERT_WEBHOOK_URL, json=payload)
             if response.status_code < 300:
-                logging.info(
-                    f"[AlertEngine] Webhook dispatched successfully for tx {payload.get('tx_id')} "
-                    f"(HTTP {response.status_code})"
+                logger.info("[AlertEngine] Webhook delivered for tx %s (HTTP %s)", tx_id, response.status_code)
+                return
+            if response.status_code < 500 and response.status_code != 429:
+                logger.warning(
+                    "[AlertEngine] Webhook rejected for tx %s: HTTP %s (not retrying)",
+                    tx_id, response.status_code,
                 )
-            else:
-                logging.warning(
-                    f"[AlertEngine] Webhook returned non-success status {response.status_code} "
-                    f"for tx {payload.get('tx_id')}: {response.text[:200]}"
-                )
-    except httpx.TimeoutException:
-        logging.error(
-            f"[AlertEngine] Webhook timed out for tx {payload.get('tx_id')} — "
-            f"target URL: {ALERT_WEBHOOK_URL}"
-        )
-    except Exception as e:
-        logging.error(
-            f"[AlertEngine] Webhook dispatch failed for tx {payload.get('tx_id')}: {e}",
-            exc_info=True,
-        )
+                return
+            logger.warning("[AlertEngine] Webhook HTTP %s for tx %s (attempt %s)", response.status_code, tx_id, attempt)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "[AlertEngine] Webhook error for tx %s to %s (attempt %s): %s",
+                tx_id, _safe_target(), attempt, type(exc).__name__,
+            )
+        except Exception:
+            logger.exception("[AlertEngine] Unexpected webhook failure for tx %s", tx_id)
+            return
+
+        if attempt < _MAX_ATTEMPTS:
+            await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+
+    logger.error("[AlertEngine] Giving up on webhook for tx %s after %s attempts", tx_id, _MAX_ATTEMPTS)
 
 
 def evaluate_and_dispatch_alert(
-    tx_id: str,
+    tx_id,
     amount: float,
     fraud_score: float,
     is_flagged: bool,
     shap_reasons: Optional[list] = None,
 ) -> None:
-    """
-    Evaluates whether a scored transaction warrants a real-time alert.
+    """Fire a background webhook when ``fraud_score >= ALERT_THRESHOLD``. Never raises."""
+    if fraud_score < HIGH_CONFIDENCE_THRESHOLD:
+        return
 
-    Criteria (either triggers the alert):
-      - fraud_score >= HIGH_CONFIDENCE_THRESHOLD (default 0.85)
-      - is_flagged is True (model exceeded its own decision threshold)
-
-    If triggered, an ``asyncio.create_task()`` fires the webhook in the
-    background so that the calling endpoint returns immediately.
-    """
-    if not (fraud_score >= HIGH_CONFIDENCE_THRESHOLD or is_flagged):
-        return  # Below alert threshold — no action required.
-
-    severity = "CRITICAL" if fraud_score >= 0.95 else (
-        "HIGH" if fraud_score >= HIGH_CONFIDENCE_THRESHOLD else "MEDIUM"
-    )
-
+    severity = "CRITICAL" if fraud_score >= CRITICAL_THRESHOLD else "HIGH"
     payload = {
         "event": "FRAUD_ALERT",
         "severity": severity,
@@ -93,17 +112,15 @@ def evaluate_and_dispatch_alert(
         "is_flagged": is_flagged,
         "shap_reasons": shap_reasons or [],
     }
+    logger.info("[AlertEngine] %s alert for tx %s (score=%.4f, amount=%.2f)", severity, tx_id, fraud_score, amount)
 
-    logging.info(
-        f"[AlertEngine] {severity} alert triggered for tx {tx_id} "
-        f"(score={fraud_score:.4f}, amount={amount:.2f})"
-    )
+    if not ALERT_WEBHOOK_URL:
+        return
 
-    # Fire-and-forget: launch webhook dispatch as a background task.
-    # This ensures the /transactions/score response is never blocked.
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_dispatch_webhook(payload))
+        task = asyncio.get_running_loop().create_task(_dispatch_webhook(payload))
     except RuntimeError:
-        # No running event loop (e.g., called from a sync context during testing).
-        logging.warning("[AlertEngine] No running event loop — webhook dispatch skipped.")
+        logger.warning("[AlertEngine] No running event loop — webhook dispatch skipped.")
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
