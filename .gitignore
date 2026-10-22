@@ -13,10 +13,13 @@ data/
 .venv/
 venv/
 
-# Model artifacts (large binaries — download or train locally)
-models/*.json
-models/*.pkl
-models/*.joblib
+# Model artifacts: the serving set is committed (the Docker/Render build copies models/);
+# anything else (legacy pickles, experiments) stays local.
+models/*
+!models/xgboost_fraud_model.json
+!models/scaler.joblib
+!models/amount_stats.json
+!models/feature_manifest.json
 
 # IDE
 .vscode/

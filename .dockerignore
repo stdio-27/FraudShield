@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+frontend
+backend
+scripts
+data
+*.csv
+.env
+.env.*
+**/__pycache__
+*.pyc
+models/*.pkl
+models/xgboost_model.joblib
+models/shap_explainer.joblib
